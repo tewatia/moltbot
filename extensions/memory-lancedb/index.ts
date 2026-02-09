@@ -6,13 +6,12 @@
  * Provides seamless auto-recall and auto-capture via lifecycle hooks.
  */
 
-import { Type } from "@sinclair/typebox";
-import * as lancedb from "@lancedb/lancedb";
-import OpenAI from "openai";
-import { randomUUID } from "node:crypto";
+import type * as LanceDB from "@lancedb/lancedb";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { Type } from "@sinclair/typebox";
+import { randomUUID } from "node:crypto";
+import OpenAI from "openai";
 import { stringEnum } from "openclaw/plugin-sdk";
-
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
@@ -23,6 +22,19 @@ import {
 // ============================================================================
 // Types
 // ============================================================================
+
+let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null = null;
+const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
+  if (!lancedbImportPromise) {
+    lancedbImportPromise = import("@lancedb/lancedb");
+  }
+  try {
+    return await lancedbImportPromise;
+  } catch (err) {
+    // Common on macOS today: upstream package may not ship darwin native bindings.
+    throw new Error(`memory-lancedb: failed to load LanceDB. ${String(err)}`, { cause: err });
+  }
+};
 
 type MemoryEntry = {
   id: string;
@@ -45,8 +57,8 @@ type MemorySearchResult = {
 const TABLE_NAME = "memories";
 
 class MemoryDB {
-  private db: lancedb.Connection | null = null;
-  private table: lancedb.Table | null = null;
+  private db: LanceDB.Connection | null = null;
+  private table: LanceDB.Table | null = null;
   private initPromise: Promise<void> | null = null;
 
   constructor(
@@ -55,14 +67,19 @@ class MemoryDB {
   ) {}
 
   private async ensureInitialized(): Promise<void> {
-    if (this.table) return;
-    if (this.initPromise) return this.initPromise;
+    if (this.table) {
+      return;
+    }
+    if (this.initPromise) {
+      return this.initPromise;
+    }
 
     this.initPromise = this.doInitialize();
     return this.initPromise;
   }
 
   private async doInitialize(): Promise<void> {
+    const lancedb = await loadLanceDB();
     this.db = await lancedb.connect(this.dbPath);
     const tables = await this.db.tableNames();
 
@@ -73,7 +90,7 @@ class MemoryDB {
         {
           id: "__schema__",
           text: "",
-          vector: new Array(this.vectorDim).fill(0),
+          vector: Array.from({ length: this.vectorDim }).fill(0),
           importance: 0,
           category: "other",
           createdAt: 0,
@@ -178,26 +195,44 @@ const MEMORY_TRIGGERS = [
   /always|never|important/i,
 ];
 
-function shouldCapture(text: string): boolean {
-  if (text.length < 10 || text.length > 500) return false;
+export function shouldCapture(text: string): boolean {
+  if (text.length < 10 || text.length > 500) {
+    return false;
+  }
   // Skip injected context from memory recall
-  if (text.includes("<relevant-memories>")) return false;
+  if (text.includes("<relevant-memories>")) {
+    return false;
+  }
   // Skip system-generated content
-  if (text.startsWith("<") && text.includes("</")) return false;
+  if (text.startsWith("<") && text.includes("</")) {
+    return false;
+  }
   // Skip agent summary responses (contain markdown formatting)
-  if (text.includes("**") && text.includes("\n-")) return false;
+  if (text.includes("**") && text.includes("\n-")) {
+    return false;
+  }
   // Skip emoji-heavy responses (likely agent output)
   const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
-  if (emojiCount > 3) return false;
+  if (emojiCount > 3) {
+    return false;
+  }
   return MEMORY_TRIGGERS.some((r) => r.test(text));
 }
 
-function detectCategory(text: string): MemoryCategory {
+export function detectCategory(text: string): MemoryCategory {
   const lower = text.toLowerCase();
-  if (/prefer|radši|like|love|hate|want/i.test(lower)) return "preference";
-  if (/rozhodli|decided|will use|budeme/i.test(lower)) return "decision";
-  if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se/i.test(lower)) return "entity";
-  if (/is|are|has|have|je|má|jsou/i.test(lower)) return "fact";
+  if (/prefer|radši|like|love|hate|want/i.test(lower)) {
+    return "preference";
+  }
+  if (/rozhodli|decided|will use|budeme/i.test(lower)) {
+    return "decision";
+  }
+  if (/\+\d{10,}|@[\w.-]+\.\w+|is called|jmenuje se/i.test(lower)) {
+    return "entity";
+  }
+  if (/is|are|has|have|je|má|jsou/i.test(lower)) {
+    return "fact";
+  }
   return "other";
 }
 
@@ -455,13 +490,17 @@ const memoryPlugin = {
     // Auto-recall: inject relevant memories before agent starts
     if (cfg.autoRecall) {
       api.on("before_agent_start", async (event) => {
-        if (!event.prompt || event.prompt.length < 5) return;
+        if (!event.prompt || event.prompt.length < 5) {
+          return;
+        }
 
         try {
           const vector = await embeddings.embed(event.prompt);
           const results = await db.search(vector, 3, 0.3);
 
-          if (results.length === 0) return;
+          if (results.length === 0) {
+            return;
+          }
 
           const memoryContext = results
             .map((r) => `- [${r.entry.category}] ${r.entry.text}`)
@@ -490,12 +529,16 @@ const memoryPlugin = {
           const texts: string[] = [];
           for (const msg of event.messages) {
             // Type guard for message object
-            if (!msg || typeof msg !== "object") continue;
+            if (!msg || typeof msg !== "object") {
+              continue;
+            }
             const msgObj = msg as Record<string, unknown>;
 
             // Only process user and assistant messages
             const role = msgObj.role;
-            if (role !== "user" && role !== "assistant") continue;
+            if (role !== "user" && role !== "assistant") {
+              continue;
+            }
 
             const content = msgObj.content;
 
@@ -524,7 +567,9 @@ const memoryPlugin = {
 
           // Filter for capturable content
           const toCapture = texts.filter((text) => text && shouldCapture(text));
-          if (toCapture.length === 0) return;
+          if (toCapture.length === 0) {
+            return;
+          }
 
           // Store each capturable piece (limit to 3 per conversation)
           let stored = 0;
@@ -534,7 +579,9 @@ const memoryPlugin = {
 
             // Check for duplicates (high similarity threshold)
             const existing = await db.search(vector, 1, 0.95);
-            if (existing.length > 0) continue;
+            if (existing.length > 0) {
+              continue;
+            }
 
             await db.store({
               text,
